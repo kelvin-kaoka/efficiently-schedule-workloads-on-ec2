@@ -4,7 +4,7 @@ version = 0.1
 
 [default]
 [default.global.parameters]
-stack_name = "compute-workflows-schedule-workloads-on-pre-existing-compute"
+stack_name = "compute-workflows-utilize-compute-as-on-demand-workers"
 region = "us-west-2"
 profile = "admin-access" ###Update this according to your AWS SSO profile name
 
