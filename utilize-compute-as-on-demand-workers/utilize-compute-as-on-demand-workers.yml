@@ -1,0 +1,741 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Written in a mix of python3 aws sdk and cloudformation
+  This is template implements a full event driven architecture that, 
+  Launches and ec2 instance to execute the mturk project using a launch template and an auto scaling group,
+  And shuts down using a scaling policy and an optional cpu utilization scaling policy(Disabled).
+
+Parameters:
+  AUTOTURKINGASGNAME:
+    Type: String
+    Default: AutoTurkingASG
+  AUTOTURKINGLAUNCHTEMPLATENAME:
+    Type: String
+    Default: AutoTurkingLaunchTemplate
+  AUTOTURKINGAMIID:
+    Type: AWS::EC2::Image::Id
+    Default: ami-<custom-ami-id> #custom ami id for the mturk project
+  AUTOTURKINGINSTANCETYPE:
+    Type: String
+    Default: t3.micro
+  AUTOTURKINGPRIVATESUBNET:
+    Type: String
+    Default: subnet-<id> #private subnet1 subnet-06e2026121d959a8e
+  AUTOTURKINGSECURITYGROUPNAME:
+    Description: Security Group Name for instance that runs the M-Turk project
+    Type: String
+    Default: M-Turk-sg
+  VPCDEFAULT:
+    Description: Default VPC ID
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-<id> ###workload vpc
+  AWSSERVICEROLEFORAUTOSCALING:
+    Description: Service Role for Auto Scaling
+    Type: String
+    Default: "" #default arn for service role for auto scaling
+
+# Globals:
+#   Function:
+
+Resources:
+####LAMBDA
+  AutoTurkingResetASGDesiredCapacityFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: AutoTurkingAutoScalingGroup
+    Properties:
+      FunctionName: AutoTurkingResetASGDesiredCapacityFunction
+      Description: "This function resets the asg desired size to 0, draining the M-Turk worker"
+      Environment:
+        Variables:
+          ASG_NAME: !Ref AUTOTURKINGASGNAME
+      Architectures:
+        # - x86_64
+        - arm64
+      InlineCode: |
+        #use set_desired_capacity to reset the desired capacity of the autoscaling group to 0
+        import boto3
+        import json
+        import logging
+        import os
+        import sys
+        from botocore.exceptions import ClientError
+
+        client = boto3.client('autoscaling')
+
+        #Set up logging
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+
+        def log(msg):
+            logger.info(msg)
+
+        #validate environment variables
+        def validate_env_var(var_name):
+            value = os.environ.get(var_name)
+            if not value:
+                log(f"ERROR: Environment variable '{var_name}' not set.")
+                sys.exit(1)
+            return value
+        
+        # def lambda_subscription_url(subscribe_url):
+        #     try:
+        #         for record in event['Records']:
+        #             sns_message = record['Sns']
+        #             message_type = sns_message.get('Type', '') 
+        #             if message_type == 'SubscriptionConfirmation':
+        #                 # Extract the SubscribeURL from the message
+        #                 subscribe_url = sns_message.get('SubscribeURL', '')
+        #                 logger.info("Subscription confirmation URL: %s", subscribe_url)
+        #     except Exception as e:
+        #         logger.error(f"Error processing record: {e}")
+
+        #reset desired capacity of autoscaling group to 0
+        asg_name = validate_env_var("ASG_NAME")
+        def drain_worker(asg_name):
+            #add a try except block to catch any errors that may occur
+            try:
+                response = client.set_desired_capacity(
+                    AutoScalingGroupName=asg_name,
+                    DesiredCapacity=0,
+                    HonorCooldown=False
+                )
+                return response
+            except ClientError as e:
+                logger.error(
+                    "Couldn't set desired capacity %s. Here's why: %s: %s",
+                    asg_name,
+                    e.response["Error"]["Code"],
+                    e.response["Error"]["Message"],
+                )
+                raise
+
+        #add a lambda_handler to call the drain_worker function
+        def lambda_handler(event, context):
+            #log the recieved event
+            log(f"Received event: {json.dumps(event)}")
+            # lambda_subscription_url(subscribe_url)  
+            drain_worker(asg_name)
+            return {
+                'statusCode': 200,
+                'body': json.dumps('AutoTurking Auto Scaling Group Reset and M-Turk worker has been drained!')
+            }
+      PackageType: Zip
+      Handler: index.lambda_handler
+      MemorySize: 128
+      # VpcConfig:
+      #   # Ipv6AllowedForDualStack: True
+      #   SecurityGroupIds:
+      #     - sg-51130a35 #default sg
+      #   SubnetIds:
+      #     - subnet-7b889f1e #where the primary db is
+      Role:
+        Fn::GetAtt:
+        - AutoTurkingDrainASGsRole
+        - Arn
+      Runtime: python3.14
+      Timeout: 60
+      # FunctionUrlConfig:
+      #   AuthType: AWS_IAM
+      #   InvokeMode: BUFFERED
+      PropagateTags: False
+      Tags:
+        Project: auto-turking
+        Deployment: zip
+
+  AutoTurkingUpdateScalingPolicyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: AutoTurkingUpdateScalingPolicyFunction
+      Description: "This function increases the asg desired size to 1, provisioning the M-Turk worker"
+      Architectures:
+        # - x86_64
+        - arm64
+      Environment:
+        Variables:
+          ASG_NAME: !Ref AUTOTURKINGASGNAME
+      Events:
+        AutoturkingS3PrefixPartitionedPutEventRule:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: default
+            RuleName: AutoturkingS3EventCreateObjectOnPrefPartitionedASGPolicyRule
+            State: ENABLED
+            Pattern:
+              source:
+              - aws.s3
+              detail-type:
+              - Object Created
+              detail:
+                bucket:
+                  name:
+                  - auto-turking
+                object:
+                  key:
+                  - partitioned
+                reason:
+                - PutObject
+            Target:
+              Id: !Ref AutoTurkingUpdateScalingPolicyFunction
+      InlineCode: |
+        #update an auto scaling group with a scaling policy
+        import boto3
+        import json
+        import logging
+        import os
+        import sys
+        from botocore.exceptions import ClientError
+
+        client = boto3.client('autoscaling')
+
+        #Set up logging
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+
+        def log(msg):
+            logger.info(msg)
+
+        #validate environment variables
+        def validate_env_var(var_name):
+            value = os.environ.get(var_name)
+            if not value:
+                log(f"ERROR: Environment variable '{var_name}' not set.")
+                sys.exit(1)
+            return value
+
+        asg_name = validate_env_var("ASG_NAME")
+        #use put_scaling_policy to add a target tracking policy for 25% cpu utilization to an auto scaling group
+        # def target_tracking_policy(asg_name):
+        #     try:
+        #         response = client.put_scaling_policy(
+        #             AutoScalingGroupName=asg_name,
+        #             PolicyName='AutoTurking25%CPUUtilizationTargetTrackingPolicy',
+        #             PolicyType='TargetTrackingScaling',
+        #             TargetTrackingConfiguration={
+        #                 'TargetValue': 0.25,
+        #                 'PredefinedMetricSpecification': {
+        #                     'PredefinedMetricType': 'ASGAverageCPUUtilization'
+        #                 }
+        #             }
+        #         )
+        #         return response
+        #     except ClientError as e:
+        #         logger.error(
+        #             "Couldn't set target tracking policy %s. Here's why: %s: %s",
+        #             asg_name,
+        #             e.response["Error"]["Code"],
+        #             e.response["Error"]["Message"],
+        #         )
+        #         raise
+
+        #use put_lifecycle_hook to add a lifecycle hook on instance termination to an auto scaling group that sends a notification to an sns topic
+        # role_arn = validate_env_var("ROLE_ARN")
+        # sns_topic_arn = validate_env_var("SNS_TOPIC_ARN")
+        # def lifecycle_hook(asg_name, role_arn, sns_topic):
+        #     try:
+        #         response = client.put_lifecycle_hook(
+        #             AutoScalingGroupName=asg_name,
+        #             LifecycleHookName='AutoTurkingLifecycleHookForInstanceTermination',
+        #             LifecycleTransition='autoscaling:EC2_INSTANCE_TERMINATING',
+        #             RoleARN=role_arn,
+        #             NotificationTargetARN=sns_topic_arn,
+        #             HeartbeatTimeout=7200, #maximum time
+        #             DefaultResult='ABANDON'
+        #         )
+        #         return response
+        #     except ClientError as e:
+        #         logger.error(
+        #             "Couldn't set lifecycle hook %s. Here's why: %s: %s",
+        #             asg_name,
+        #             e.response["Error"]["Code"],
+        #             e.response["Error"]["Message"],
+        #         )
+        #         raise
+
+        #add a complete_lifecycle_action call to complete the lifecycle action
+        # hook_name = validate_env_var("HOOK_NAME")
+        # def complete_lifecycle_actions(asg_name):
+        #     try:
+        #         response = client.complete_lifecycle_action(
+        #             LifecycleHookName='AutoTurkingLifecycleHookForInstanceTermination',
+        #             AutoScalingGroupName=asg_name,
+        #             LifecycleActionResult='CONTINUE'
+        #         )
+        #         return response
+        #     except ClientError as e:
+        #         logger.error(
+        #             "Couldn't complete lifecycle action. Here's why: %s: %s",
+        #             e.response["Error"]["Code"],
+        #             e.response["Error"]["Message"],
+        #         )
+        #         raise
+
+        #provision worker instance by setting desired capacity of autoscaling group to 1
+        def provision_worker(asg_name):
+            #add a try except block to catch any errors that may occur
+            try:
+                response = client.set_desired_capacity(
+                    AutoScalingGroupName=asg_name,
+                    DesiredCapacity=1,
+                    HonorCooldown=True
+                )
+                return response
+            except ClientError as e:
+                logger.error(
+                    "Couldn't set desired capacity %s. Here's why: %s: %s",
+                    asg_name,
+                    e.response["Error"]["Code"],
+                    e.response["Error"]["Message"],
+                )
+                raise
+
+        #add a lambda handler to call the provision_worker function.
+        def lambda_handler(event, context):
+            #log recieved event
+            log(f"Received event: {json.dumps(event, indent=2)}")
+            provision_worker(asg_name)
+            return {
+                'statusCode': 200,
+                'body': json.dumps('AutoTurking Auto Scaling Group Reset and M-Turk worker has been provisioned!')
+            }
+      PackageType: Zip
+      Handler: index.lambda_handler
+      MemorySize: 128
+      # VpcConfig:
+      #   # Ipv6AllowedForDualStack: True
+      #   SecurityGroupIds:
+      #     - sg-51130a35 #default sg
+      #   SubnetIds:
+      #     - subnet-7b889f1e #where the primary db is
+      Role:
+        Fn::GetAtt:
+        - AutoTurkingUpdateASGsRole
+        - Arn
+      Runtime: python3.14
+      Timeout: 60
+      PropagateTags: False
+      Tags:
+        Project: auto-turking
+        Deployment: zip
+
+####LAMBDA PERMISSION
+  AutoTurkingResetASGDesiredCapacityEventPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !Ref AutoTurkingResetASGDesiredCapacityFunction
+        Action: lambda:InvokeFunction #lambda:InvokeFunctionUrl is not supported for resource based policies and is only used with principals
+        Principal: sns.amazonaws.com
+        SourceArn: !GetAtt AutoTurkingASGSNSTopic.TopicArn
+
+  AutoTurkingUpdateScalingPolicyFunctionEventPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !Ref AutoTurkingUpdateScalingPolicyFunction
+        Action: lambda:InvokeFunction
+        Principal: events.amazonaws.com
+        SourceArn: !GetAtt AutoTurkingUpdateScalingPolicyFunctionAutoturkingS3PrefixPartitionedPutEventRule.Arn
+
+####IAM
+  AutoTurkingUpdateASGsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: 'Update ASGs Role Created by Cloudformation'
+      Policies:
+      - PolicyName: 'auto-turking-lambda-execution-for-updating-ASGs-policies'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            Resource:
+            - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - Fn::Sub:
+              - arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}*
+              - FunctionName: AutoTurkingUpdateScalingPolicyFunction
+          # - Effect: Allow
+          #   Action:
+          #   - autoscaling:CompleteLifecycleAction
+          #   Resource: 
+          #   - !Sub "arn:aws:autoscaling:*:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/AutoTurkingASG"
+          - Effect: Allow
+            Action:
+            - ec2:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - autoscaling:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - ec2:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - cloudwatch:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - events:*
+            Resource: "*"
+
+  AutoTurkingDrainASGsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: 'Drain ASG Role Created by Cloudformation'
+      Policies:
+      - PolicyName: 'auto-turking-lambda-execution-for-draining-ASGs-policies'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            Resource:
+            - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - Fn::Sub:
+              - arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}*
+              - FunctionName: AutoTurkingResetASGDesiredCapacityFunction
+          # - Effect: Allow
+          #   Action:
+          #   - autoscaling:CompleteLifecycleAction
+          #   Resource: 
+          #   - !Sub "arn:aws:autoscaling:*:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/AutoTurkingASG"
+          - Effect: Allow
+            Action:
+            - ec2:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - autoscaling:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - ec2:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - cloudwatch:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - events:*
+            Resource: "*"
+
+  AutoturkingAutoScalingInstanceProfileRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        # - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMFullAccess
+      Policies:
+      - PolicyName: auto-turking-ec2-instance-profile-policies
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            Resource:
+            - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - Fn::Sub:
+              - arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}:*
+              - FunctionName: AutoTurkingResetASGDesiredCapacityFunction
+                  # Fn::Join: !Join ['-', ['auto-turking-asg-termination-topic', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+          - Effect: Allow
+            Action:
+            - backup:DescribeBackupJob
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - kms:Decrypt
+            - kms:Encrypt
+            - kms:ReEncryptTo
+            - kms:GenerateDataKeyWithoutPlaintext
+            - kms:DescribeKey
+            - kms:RetireGrant
+            - kms:CreateGrant
+            - kms:ReEncryptFrom
+            - kms:GenerateDataKey
+            Resource:
+            - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/b28ff5cb-2374-4311-8613-89f582429c28 #autoturking kms key
+          - Effect: Allow
+            Action:
+            - s3:ListBucket
+            - s3:GetBucketLocation
+            Resource:
+            - Fn::Sub:
+              - arn:${AWS::Partition}:s3:::${BucketName}
+              - BucketName: auto-turking
+          - Effect: Allow
+            Action:
+            - s3:PutObject*
+            - s3:GetObject*
+            - s3:DeleteObject*
+            Resource:
+            - Fn::Sub:
+              - arn:${AWS::Partition}:s3:::${BucketName}
+              - BucketName: auto-turking
+            - Fn::Sub:
+              - arn:${AWS::Partition}:s3:::${BucketName}/*
+              - BucketName: auto-turking
+          - Effect: Allow
+            Action:
+            - cloudwatch:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - ec2:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - logs:DescribeLogStreams
+            - logs:GetLogEvents
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - sns:ListSubscriptions
+            - sns:ListTopics
+            - sns:Publish
+            Resource:
+            - !Sub 
+              - "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${TopicName}"
+              - TopicName: !GetAtt AutoTurkingASGSNSTopic.TopicName
+          # - Effect: Allow
+          #   Action:
+          #   - rds-data:ExecuteSql
+          #   - rds-data:ExecuteStatement
+          #   - rds-data:BatchExecuteStatement
+          #   - rds-data:BeginTransaction
+          #   - rds-data:CommitTransaction
+          #   - rds-data:RollbackTransaction
+          #   - tag:GetResources
+          #   Resource: "*"
+          #ssm
+          # - Effect: Allow
+          #   Action:
+          #   - ssm:StartSession
+          #   - ssm:SendCommand
+          #   Resource:
+          #   - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+          #   - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/SSM-SessionManagerRunShell
+          #   Condition:
+          #     BoolIfExists:
+          #       ssm:SessionDocumentAccessCheck: 'true'
+          # - Effect: Allow
+          #   Action:
+          #   - ssm:DescribeSessions
+          #   - ssm:GetConnectionStatus
+          #   - ssm:DescribeInstanceInformation
+          #   - ssm:DescribeInstanceProperties
+          #   - ec2:DescribeInstances
+          #   Resource: "*"
+          # - Effect: Allow
+          #   Action:
+          #   - ssm:TerminateSession
+          #   - ssm:ResumeSession
+          #   Resource:
+          #   - arn:aws:ssm:*:*:session/${aws:userid}-* #use userid for iam user & username for federated user    
+
+####INSTANCE PROFILE
+  AutoTurkingInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - Ref: AutoturkingAutoScalingInstanceProfileRole
+
+####SECURITY GROUP
+  AutoTurkingSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPCDEFAULT
+      GroupDescription: Allows ingress and egress traffic
+      GroupName: !Ref AUTOTURKINGSECURITYGROUPNAME
+      Tags:
+        - Value: Project
+          Key: autoturking
+
+  AutoTurkingSecurityGroupHTTPsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allows ingress https traffic from nat gateway to instance that runs the the M-Turk project
+      GroupId: !GetAtt AutoTurkingSecurityGroup.GroupId
+      IpProtocol: tcp #"-1"
+      FromPort: 443 #0
+      ToPort: 443 #65535
+      CidrIp: 0.0.0.0/0
+
+  AutoTurkingSecurityGroupHTTPIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allows ingress http traffic from nat gateway to instance that runs the M-Turk project
+      GroupId: !GetAtt AutoTurkingSecurityGroup.GroupId
+      IpProtocol: tcp #"-1"
+      FromPort: 80 #0
+      ToPort: 80 #65535
+      CidrIp: 0.0.0.0/0
+
+  AutoTurkingSecurityGroupHTTPsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allows egress https traffic from instance that runs the M-Turk project
+      GroupId: !GetAtt AutoTurkingSecurityGroup.GroupId
+      IpProtocol: tcp #"-1"
+      FromPort: 443 #0
+      ToPort: 443 #65535
+      CidrIp: 0.0.0.0/0
+
+  AutoTurkingSecurityGroupHTTPEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allows egress http traffic from instance that runs the M-Turk project
+      GroupId: !GetAtt AutoTurkingSecurityGroup.GroupId
+      IpProtocol: tcp #"-1"
+      FromPort: 80 #0
+      ToPort: 80 #65535
+      CidrIp: 0.0.0.0/0
+
+####EC2 LAUNCHTEMPLATE
+  AutoTurkingLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Ref AUTOTURKINGLAUNCHTEMPLATENAME
+      LaunchTemplateData:
+        ImageId: !Ref AUTOTURKINGAMIID #add string
+        InstanceInitiatedShutdownBehavior: terminate
+        IamInstanceProfile: 
+          Arn: !GetAtt AutoTurkingInstanceProfile.Arn
+        BlockDeviceMappings: 
+          - DeviceName: /dev/xvda
+            Ebs: 
+              VolumeSize: 30
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Throughput: 150
+              Iops: 3000
+        InstanceType: !Ref AUTOTURKINGINSTANCETYPE
+        # InstanceRequirements:
+        #   AllowedInstanceTypes:
+        #     # - c7gn.*
+        #     - c7g.*
+        #     - m7g.*
+        #   MemoryMiB:
+        #     Max: 16
+        #     Min: 4
+        #   VCpuCount:
+        #     Max: 8
+        #     Min: 4
+        # KeyName: #add string
+        SecurityGroupIds:
+          - !Ref AutoTurkingSecurityGroup
+        TagSpecifications:
+          - ResourceType: "instance"
+            Tags:
+            - Key: "Project"
+              Value: "autoturking"
+          - ResourceType: "volume"
+            Tags:
+            - Key: "Project"
+              Value: "autoturking"
+      TagSpecifications:
+        - ResourceType: "launch-template"
+          Tags:
+          - Key: "Project"
+            Value: "autoturking"
+      VersionDescription: "Runs mturk project"
+
+####ASG
+  AutoTurkingAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Ref AUTOTURKINGASGNAME
+      DefaultInstanceWarmup: 300
+      # AvailabilityZones:
+      #   - us-west-2a #where the primary db is 
+      VPCZoneIdentifier:
+        - !Ref AUTOTURKINGPRIVATESUBNET #!Select [ 0, !GetAZs '' ] #subnet-7b889f1e #where the primary db is 
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AutoTurkingLaunchTemplate
+        Version: !GetAtt AutoTurkingLaunchTemplate.LatestVersionNumber
+      MaxSize: 1
+      MinSize: 0
+      DesiredCapacity: 0
+      ServiceLinkedRoleARN: !Ref AWSSERVICEROLEFORAUTOSCALING
+      TerminationPolicies:
+        - ClosestToNextInstanceHour
+      Tags:
+        - Key: "Project"
+          PropagateAtLaunch: false
+          Value: "autoturking"
+
+####SNS
+  AutoTurkingASGSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Notification from M-Turk worker"
+      TopicName: !Join ['-', ['auto-turking-asg-reset-asg-desired-capacity-topic', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]] #required to be unique as there is no replace
+      Tags:
+        - Key: "Project"
+          Value: "autoturking"
+
+  AutoTurkingASGSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt AutoTurkingResetASGDesiredCapacityFunction.Arn #AutoTurkingResetASGDesiredCapacityFunctionUrl.FunctionUrl
+      Protocol: lambda #https ##function urls not supported for role based policies and instead used in indentity-based policies
+      TopicArn: !Ref AutoTurkingASGSNSTopic
+
+  AutoTurkingASGSNSTopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: "*"
+      Topics:
+        - !Ref AutoTurkingASGSNSTopic

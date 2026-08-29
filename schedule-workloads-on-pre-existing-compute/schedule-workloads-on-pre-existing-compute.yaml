@@ -1,0 +1,492 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Lambda function written in python3.14
+  This function is for creating materialized views for analytics db cluster and hubs automation on pre-existing compute instance. 
+  The function is triggered by an event from AWS SSM Parameter Store when the parameter /presetdb/dbClusterIdentifier is updated. The function starts the execution of an AWS SSM Automation Document that runs the materialized view SQL query on the analytics db cluster and hubs automation on the pre-existing compute instance.
+
+Parameters:
+  PRESETDBIDENTIFIERPARAMETER:
+    Type: String
+    Description: SSM Parameter Store Name
+    Default: /presetdb/dbClusterIdentifier
+  PresetSSMExecutionFailureNotificationEmail:
+    Type: String
+    Description: Email address to notify when the Preset AWS SSM Automation Document fails during execution
+    AllowedPattern: ^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$
+    ConstraintDescription: Enter a valid email address
+    Default: "" #valid email address to receive failure notifications for Preset SSM Automation Document execution failures
+  # INSTANCEIDTOCREATEMATERIALIZEDVIEWS:
+  #   Type: String
+  #   Description: Instance ID to execute matreliazed views
+  #   Default: i-0a9c6b824f2b10261
+
+Resources:
+  ######LAMBDA
+  PresetMaterializedSQLQueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: PresetMaterializedViewFunction
+      Description: "Lambda function for executing materialized view sql query on Analytics db cluster"
+      Role: !GetAtt PresetMaterializedSQLQueryRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Architectures:
+        - arm64
+      PackageType: Zip
+      Handler: index.lambda_handler
+      Events:
+        PresetMaterializedSQLQueryTriggerRule:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: default
+            RuleName: PresetMaterializedSQLQueryTriggerRule
+            State: ENABLED
+            Pattern:
+              source:
+                - aws.ssm
+              detail-type:
+                - Parameter Store Change
+              detail:
+                operation:
+                  - Update
+                name:
+                  - !Ref PRESETDBIDENTIFIERPARAMETER
+                type:
+                  - String
+            Target:
+              Id: !Ref PresetMaterializedSQLQueryFunction
+      Environment:
+        Variables:
+          SSM_DOCUMENT_NAME: !Ref PresetMaterializedSQLQueryAutomationDocument
+          #SSM_DOCUMENT_NAME: !Sub "${PresetMaterializedSQLQueryAutomationDocument},${HubsAutomationDocument}"
+      InlineCode: |
+        import boto3
+        import logging
+        import os
+        import sys
+
+        #configure logger
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+
+        #validate environment variable
+        def validate_environment_variables(var_name):
+          value = os.environ.get(var_name)
+          if not value:
+              logger.error(f"ERROR: Environment variable '{var_name}' not set.")
+              sys.exit(1)
+          return value
+
+        # def lambda_handler(event, context):
+        #   try:
+        #       ssm = boto3.client('ssm')
+        #       logger.info('Recieved Event: %s', event)
+        #       # Split the comma-separated environment variable into a list
+        #       ssm_document_names = validate_environment_variables('SSM_DOCUMENT_NAME').split(',')
+              
+        #       for doc_name in ssm_document_names:
+        #           doc_name = doc_name.strip()
+        #           logger.info('Starting SSM Document: %s', doc_name)
+        #           ssm.start_automation_execution(
+        #               DocumentName=doc_name
+        #           )
+              
+        #       logger.info('Successfully started all automation documents')
+        #   except Exception as e:
+        #       logger.error('Failed to start ssm execution: %s ', e)
+        #       raise e
+
+        def lambda_handler(event, context):
+            try:
+                ssm = boto3.client('ssm')
+                logger.info('Recieved Event: %s', event)
+                ssm_document_name = validate_environment_variables('SSM_DOCUMENT_NAME')
+                logger.info('SSM Document Name: %s', ssm_document_name)
+                ssm.start_automation_execution(
+                    DocumentName= ssm_document_name
+                )
+                logger.info('Successfully started automation document')
+            except Exception as e:
+                logger.error('Failed to start ssm execution: %s ', e)
+                raise e
+      Runtime: python3.14
+      Tags:
+        project: preset
+        purpose: "Lambda function for executing materialized view sql query"
+
+  ######LAMBDA PERMISSION
+  PresetMaterializedSQLQueryLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PresetMaterializedSQLQueryFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PresetMaterializedSQLQueryFunctionPresetMaterializedSQLQueryTriggerRule.Arn
+
+  ######IAM ROLE
+  PresetMaterializedSQLQueryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PresetMaterializedSQLQueryRole-${AWS::Region}"
+      Description: "Role for executing sql query for materilized view on provisioned cluster"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Tags:
+        - Key: "project"
+          Value: "preset"
+        - Key: "purpose"
+          Value: "Role for executing materialized view sql query"
+      Policies:
+        - PolicyName: "MaterializedSQLQueryRolePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub
+                    - "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}:*"
+                    - FunctionName: PresetMaterializedViewFunction
+              - Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                Resource:
+                  - !Sub
+                    - "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${DocumentName}"
+                    - DocumentName: !Ref PresetMaterializedSQLQueryAutomationDocument
+                  - !Sub
+                    - arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${DocumentName}:$DEFAULT
+                    - DocumentName: !Ref PresetMaterializedSQLQueryAutomationDocument
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-execution/*
+                  - !Sub
+                    - "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${DocumentName}"
+                    - DocumentName: !Ref HubsAutomationDocument
+                  - !Sub
+                    - arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${DocumentName}:$DEFAULT
+                    - DocumentName: !Ref HubsAutomationDocument
+
+  PresetMaterializedSQLQuerySSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "PresetMaterializedSQLQuerySSMRole-${AWS::Region}"
+      Description: "Role for executing sql query for materilized view on provisioned cluster thru ec2"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "ssm.amazonaws.com"
+                - "ec2.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Tags:
+        - Key: "project"
+          Value: "preset"
+        - Key: "purpose"
+          Value: "Role for executing materialized view sql query thru ec2"
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonSSMAutomationRole"
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - ssm:StartAssociationsOnce
+                  - ssm:CreateAssociation
+                  - ssm:CreateAssociationBatch
+                  - ssm:UpdateAssociation
+                Resource: "*"
+                Effect: Allow
+          PolicyName: materialized-views-ssm-association-policy
+        - PolicyName: "MaterializedSQLQuerySSMRolePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PresetMaterializedSQLQueryExecutionFailureTopic
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceInformation
+                  - ssm:ListCommands
+                  - ssm:ListCommandInvocations
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub
+                    - "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${DocumentName}"
+                    - DocumentName: !Sub "AnalyticsMaterializedViewsAutomationWorkflow-${AWS::Region}"
+                  - !Sub
+                    - arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${DocumentName}:$DEFAULT
+                    - DocumentName: !Sub "AnalyticsMaterializedViewsAutomationWorkflow-${AWS::Region}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::automation-definition/AWS-RunShellScript:$DEFAULT"
+
+  #####SSM
+  PresetMaterializedSQLQueryAutomationDocument:
+    Type: "AWS::SSM::Document"
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Tags:
+        - Key: project
+          Value: preset
+        - Key: purpose
+          Value: materialized views automation
+      Name: !Sub "AnalyticsMaterializedViewAutomationsWorkflow-${AWS::Region}"
+      Content:
+        description: "Execute matrialized views on ec2 for Preset"
+        schemaVersion: "0.3"
+        assumeRole: !GetAtt PresetMaterializedSQLQuerySSMRole.Arn
+        parameters:
+          # instanceId:
+          #   type: String
+          #   description: Instance to execute materilazed view
+          #   default: !Ref INSTANCEIDTOCREATEMATERIALIZEDVIEWS
+          topicARN:
+            type: String
+            description: SNS Topic to send failure notification to
+            default: !Ref PresetMaterializedSQLQueryExecutionFailureTopic
+        mainSteps:
+          - name: "getInstanceId"
+            action: aws:executeAwsApi
+            inputs:
+              Service: ec2
+              Api: DescribeInstances
+              Filters:
+                - Name: "tag:Name"
+                  Values: ["instance-for-vs-code-remote"]
+                - Name: "instance-state-name"
+                  Values: ["running"]
+            outputs:
+              - Name: InstanceId
+                Selector: "$.Reservations..Instances..InstanceId"
+                Type: "StringList"
+          - name: RunMaterializedViews
+            action: aws:runCommand
+            isEnd: true
+            maxAttempts: 3
+            onFailure: step:SNSFailureNotification
+            inputs:
+              DocumentName: "AWS-RunShellScript"
+              InstanceIds:
+                - "{{ getInstanceId.instanceId }}"
+              Parameters:
+                commands:
+                  - |
+                    su - ubuntu <<EOF
+                    cd /home/ubuntu/code/analytic_metrics_scripts && source /home/ubuntu/code/analytic_metrics/.envrc && ./daily_run.sh
+                    cd /home/ubuntu/code/HT_ANALYTICS && ./deploy.sh
+                    EOF
+          - name: SNSFailureNotification
+            action: aws:runCommand
+            isEnd: true
+            inputs:
+              DocumentName: "AWS-RunShellScript"
+              InstanceIds:
+                - "{{ getInstanceId.instanceId }}"
+              Parameters:
+                commands:
+                  - |
+                    aws sns publish --topic-arn "{{ topicARN }}" \
+                        --message "The SSM Document responsible for analytic materialized views failed during execution" \
+                        --subject "Analytics Materialized Views SSM Document FAILED"
+
+  HubsAutomationDocument:
+    Type: "AWS::SSM::Document"
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Tags:
+        - Key: project
+          Value: preset
+        - Key: purpose
+          Value: materialized views automation
+      Name: !Sub "HubsAutomationWorkflow-${AWS::Region}"
+      Content:
+        description: "Execute hubs automations on ec2 for Preset"
+        schemaVersion: "0.3"
+        assumeRole: !GetAtt PresetMaterializedSQLQuerySSMRole.Arn
+        parameters:
+          # instanceId:
+          #   type: String
+          #   description: Instance to execute materilazed view
+          #   default: !Ref INSTANCEIDTOCREATEMATERIALIZEDVIEWS
+          topicARN:
+            type: String
+            description: SNS Topic to send failure notification to
+            default: !Ref PresetMaterializedSQLQueryExecutionFailureTopic
+        mainSteps:
+          - name: "getInstanceId"
+            action: aws:executeAwsApi
+            inputs:
+              Service: ec2
+              Api: DescribeInstances
+              Filters:
+                - Name: "tag:Name"
+                  Values: ["instance-for-vs-code-remote"]
+                - Name: "instance-state-name"
+                  Values: ["running"]
+            outputs:
+              - Name: InstanceId
+                Selector: "$.Reservations..Instances..InstanceId"
+                Type: "StringList"
+          - name: RunMaterializedViews
+            action: aws:runCommand
+            isEnd: true
+            maxAttempts: 3
+            onFailure: step:SNSFailureNotification
+            inputs:
+              DocumentName: "AWS-RunShellScript"
+              InstanceIds:
+                - "{{ getInstanceId.instanceId }}"
+              Parameters:
+                commands:
+                  - |
+                    su - ubuntu <<EOF
+                    cd /home/ubuntu/code/HUB_METRICS && source /home/ubuntu/code/HUB_METRICS/.envrc && ./hubdailyrun.sh
+                    EOF
+          - name: SNSFailureNotification
+            action: aws:runCommand
+            isEnd: true
+            inputs:
+              DocumentName: "AWS-RunShellScript"
+              InstanceIds:
+                - "{{ getInstanceId.instanceId }}"
+              Parameters:
+                commands:
+                  - |
+                    aws sns publish --topic-arn "{{ topicARN }}" \
+                        --message "The SSM Document responsible for hubs automations failed during execution" \
+                        --subject "Hubs Automation SSM Document FAILED"
+
+  # PresetMaterializedSQLQueryRunCommandAssociation:
+  #   Type: AWS::SSM::Association
+  #   Properties:
+  #     AssociationName: PresetMaterializedSQLQuerySSMDocumentAssociation
+  #     Name: !Ref PresetMaterializedSQLQueryAutomationDocument
+  #     Parameters:
+  #       AutomationAssumeRole:
+  #         - !GetAtt PresetMaterializedSQLQuerySSMRole.Arn
+  #     Targets:
+  #       - Key: InstanceIds
+  #         Values:
+  #           - !Ref INSTANCEIDTOCREATEMATERIALIZEDVIEWS
+  #     AutomationTargetParameterName: InstanceId
+  #     OutputLocation:
+  #       S3Location:
+  #         OutputS3BucketName: project-interactive-map
+  #         OutputS3KeyPrefix: 'materialized-views-run-logs/'
+
+  ####EventBridge
+  # PresetMaterializedSQLQueryCommandStatusChangeRule:
+  #   Type: AWS::Events::Rule
+  #   Properties:
+  #     Description: 'Notifies an SNS topic upon completion or failure of a Run Command execution.'
+  #     EventPattern:
+  #       source:
+  #         - aws.ssm
+  #       detail-type:
+  #         - "Systems Manager Command Status Change"
+  #         - "EC2 Automation Step Status-change Notification"
+  #         - "EC2 Automation Execution Status-change Notification"
+  #       detail:
+  #         status:
+  #           - Success
+  #           - TimedOut
+  #           - Failed
+  #           - Cancelled
+  #         documentName:
+  #           - !Ref PresetMaterializedSQLQueryAutomationDocument
+  #     State: ENABLED
+  #     Targets:
+  #       - Arn: !Ref PresetMaterializedSQLQueryExecutionFailureTopic
+  #         Id: SsmRunCommandSnsTarget
+
+  #####SNS
+  PresetMaterializedSQLQueryExecutionFailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName:
+        !Join [
+          "-",
+          [
+            "Preset-Materialized-Views-SSM-document-execution-failure-topic",
+            !Select [
+              4,
+              !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]],
+            ],
+          ],
+        ]
+      DisplayName: "Preset Materialized view SSM document execution failure"
+      Tags:
+        - Key: project
+          Value: preset
+
+  PresetMaterializedSQLQueryExecutionFailureSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref PresetSSMExecutionFailureNotificationEmail
+      TopicArn: !Ref PresetMaterializedSQLQueryExecutionFailureTopic
+
+  # PresetMaterializedSQLQueryExecutionFailureTopicPolicy:
+  #   Type: 'AWS::SNS::TopicPolicy'
+  #   Properties:
+  #     PolicyDocument:
+  #       Statement:
+  #         - Sid: Allow-Publish-For-Preset-SSM-Document-Execution-Failure-Topic-Policy
+  #           Effect: Allow
+  #           Principal:
+  #             Service:
+  #               - ssm.amazonaws.com
+  #           Action: 'sns:Publish'
+  #           Resource:
+  #           - !Sub
+  #             - "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${TopicName}"
+  #             - TopicName: !GetAtt PresetMaterializedSQLQueryExecutionFailureTopic.TopicName
+  #           Condition:
+  #             ArnLike:
+  #               aws:SourceArn:
+  #               - !Sub
+  #                 - "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${DocumentName}"
+  #                 - DocumentName: !Ref PresetMaterializedSQLQueryAutomationDocument
+  #               - !Sub
+  #                 - arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${DocumentName}:$DEFAULT
+  #                 - DocumentName: !Ref PresetMaterializedSQLQueryAutomationDocument
+  #     Topics:
+  #       - !Ref PresetMaterializedSQLQueryExecutionFailureTopic
+
+  # PresetMaterializedSQLQueryEVentsSnsTopicPolicy:
+  #   Type: AWS::SNS::TopicPolicy
+  #   Properties:
+  #     PolicyDocument:
+  #       Statement:
+  #         - Effect: Allow
+  #           Principal:
+  #             Service: events.amazonaws.com
+  #           Action: 'sns:Publish'
+  #           Resource: !Ref PresetMaterializedSQLQueryExecutionFailureTopic
+  #     Topics:
+  #       - !Ref PresetMaterializedSQLQueryExecutionFailureTopic
