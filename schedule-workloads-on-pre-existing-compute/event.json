@@ -1,0 +1,16 @@
+{
+    "version": "0",
+    "id": "9547ef7d-3b7e-4057-b6cb-5fdf01ee7c8f",
+    "detail-type": "Parameter Store Change",
+    "source": "aws.ssm",
+    "account": "123456789012",
+    "time": "2017-05-22T16:44:48Z",
+    "region": "us-west-2",
+    "resources": ["arn:aws:ssm:us-east-1:123456789012:parameter/foo"],
+    "detail": {
+      "operation": "Update",
+      "name": "/presetdb/dbClusterIdentifier",
+      "type": "String",
+      "description": "DB Cluster Identifier"
+    }
+}

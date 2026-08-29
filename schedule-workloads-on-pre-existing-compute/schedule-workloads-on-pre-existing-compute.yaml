@@ -297,7 +297,7 @@ Resources:
                   - |
                     su - ubuntu <<EOF
                     cd /home/ubuntu/code/analytic_metrics_scripts && source /home/ubuntu/code/analytic_metrics/.envrc && ./daily_run.sh
-                    cd /home/ubuntu/code/HT_ANALYTICS && ./deploy.sh
+                    cd /home/ubuntu/code/ANALYTICS && ./deploy.sh
                     EOF
           - name: SNSFailureNotification
             action: aws:runCommand
