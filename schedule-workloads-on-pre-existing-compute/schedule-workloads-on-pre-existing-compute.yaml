@@ -19,7 +19,7 @@ Parameters:
   # INSTANCEIDTOCREATEMATERIALIZEDVIEWS:
   #   Type: String
   #   Description: Instance ID to execute matreliazed views
-  #   Default: i-0a9c6b824f2b10261
+  #   Default: "" ##incase we need to execute directly on isntance, update this with the instance id of the pre-existing compute instance where the materialized views will be created
 
 Resources:
   ######LAMBDA

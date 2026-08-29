@@ -140,7 +140,7 @@ Resources:
       #   InvokeMode: BUFFERED
       PropagateTags: False
       Tags:
-        Project: auto-turking
+        Project: project-auto-turking
         Deployment: zip
 
   AutoTurkingUpdateScalingPolicyFunction:
@@ -169,7 +169,7 @@ Resources:
               detail:
                 bucket:
                   name:
-                  - auto-turking
+                  - project-auto-turking
                 object:
                   key:
                   - partitioned
@@ -315,7 +315,7 @@ Resources:
       Timeout: 60
       PropagateTags: False
       Tags:
-        Project: auto-turking
+        Project: project-auto-turking
         Deployment: zip
 
 ####LAMBDA PERMISSION
@@ -350,7 +350,7 @@ Resources:
               - 'sts:AssumeRole'
       Description: 'Update ASGs Role Created by Cloudformation'
       Policies:
-      - PolicyName: 'auto-turking-lambda-execution-for-updating-ASGs-policies'
+      - PolicyName: 'project-auto-turking-lambda-execution-for-updating-ASGs-policies'
         PolicyDocument:
           Version: '2012-10-17'
           Statement:
@@ -407,7 +407,7 @@ Resources:
               - 'sts:AssumeRole'
       Description: 'Drain ASG Role Created by Cloudformation'
       Policies:
-      - PolicyName: 'auto-turking-lambda-execution-for-draining-ASGs-policies'
+      - PolicyName: 'project-auto-turking-lambda-execution-for-draining-ASGs-policies'
         PolicyDocument:
           Version: '2012-10-17'
           Statement:
@@ -465,7 +465,7 @@ Resources:
         # - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
         - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMFullAccess
       Policies:
-      - PolicyName: auto-turking-ec2-instance-profile-policies
+      - PolicyName: project-auto-turking-ec2-instance-profile-policies
         PolicyDocument:
           Version: '2012-10-17'
           Statement:
@@ -482,7 +482,7 @@ Resources:
             - Fn::Sub:
               - arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}:*
               - FunctionName: AutoTurkingResetASGDesiredCapacityFunction
-                  # Fn::Join: !Join ['-', ['auto-turking-asg-termination-topic', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+                  # Fn::Join: !Join ['-', ['project-auto-turking-asg-termination-topic', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
           - Effect: Allow
             Action:
             - backup:DescribeBackupJob
@@ -507,7 +507,7 @@ Resources:
             Resource:
             - Fn::Sub:
               - arn:${AWS::Partition}:s3:::${BucketName}
-              - BucketName: auto-turking
+              - BucketName: project-auto-turking
           - Effect: Allow
             Action:
             - s3:PutObject*
@@ -516,10 +516,10 @@ Resources:
             Resource:
             - Fn::Sub:
               - arn:${AWS::Partition}:s3:::${BucketName}
-              - BucketName: auto-turking
+              - BucketName: project-auto-turking
             - Fn::Sub:
               - arn:${AWS::Partition}:s3:::${BucketName}/*
-              - BucketName: auto-turking
+              - BucketName: project-auto-turking
           - Effect: Allow
             Action:
             - cloudwatch:*
@@ -715,7 +715,7 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       DisplayName: "Notification from M-Turk worker"
-      TopicName: !Join ['-', ['auto-turking-asg-reset-asg-desired-capacity-topic', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]] #required to be unique as there is no replace
+      TopicName: !Join ['-', ['project-auto-turking-asg-reset-asg-desired-capacity-topic', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]] #required to be unique as there is no replace
       Tags:
         - Key: "Project"
           Value: "autoturking"

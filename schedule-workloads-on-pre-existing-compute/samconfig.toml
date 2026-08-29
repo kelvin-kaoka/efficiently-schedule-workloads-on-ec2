@@ -6,7 +6,7 @@ version = 0.1
 [default.global.parameters]
 stack_name = "compute-workflows-schedule-workloads-on-pre-existing-compute"
 region = "us-west-2"
-profile = "admin-access"
+profile = "admin-access" ###Update this according to your AWS SSO profile name
 
 [default.build.parameters]
 parallel = true
