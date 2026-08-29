@@ -13,7 +13,7 @@ Each subdirectory contains its own SAM template, source code, and configuration 
 I have included event.json for local testing.
 
 IMPORTANT:
- - The code wont work as is; update the template, event.json and samconfig parameters for the commented items.
+ - The code wont work as is; update the template, event.json and samconfig parameters for the commented items, update s3 bucket in all refences too.
 
 ## Prerequisites
 
