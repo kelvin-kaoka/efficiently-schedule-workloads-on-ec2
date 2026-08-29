@@ -38,11 +38,11 @@ sam build
 ### 2) Validate
 
 ```bash
-sam validate
+sam validate --lint
 ```
 
 ### 3) Deploy
 
 ```bash
-sam deploy --lint
+sam deploy
 ```
